@@ -1,4 +1,4 @@
-# NFS and SMB Configuration Script
+# NFS and SMB Master Configuration Script
 
 A user-friendly Bash script to simplify the setup and management of NFS (Network File System) and SMB (Server Message Block) shares on Linux systems (Red Hat and Debian based). It provides a menu-driven interface to automate various tasks.
 
