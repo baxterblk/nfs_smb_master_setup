@@ -1,24 +1,58 @@
 #!/bin/bash
 
+# Logging function with timestamps
+log_message() {
+    local message="$1"
+    echo -e "$(date +"%Y-%m-%d %H:%M:%S") - $message" | tee -a "$LOG_FILE"
+}
+
+# Progress bar for executing commands
+show_progress() {
+    local cmd="$1"
+    {
+        eval "$cmd"
+        echo "100"
+    } | dialog --gauge "$2" 10 60 0
+}
+
 # Ensure dialog is installed
-if ! command -v dialog &> /dev/null; then
-    if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        case "$ID" in
-            ubuntu|debian) show_progress "sudo apt update && sudo apt install -y dialog" "Installing dialog..." ;;
-            centos|fedora|rhel) show_progress "sudo dnf install -y dialog" "Installing dialog..." ;;
-            *) echo "Unsupported distribution. Please install 'dialog' manually." && exit 1 ;;
-        esac
-    else
-        echo "Could not determine OS. Please install 'dialog' manually."
-        exit 1
+ensure_dialog_installed() {
+    if ! command -v dialog &> /dev/null; then
+        if [[ -f /etc/os-release ]]; then
+            source /etc/os-release
+            case "$ID" in
+                ubuntu|debian) sudo apt update && sudo apt install -y dialog ;;
+                centos|fedora|rhel) sudo dnf install -y dialog ;;
+                *) 
+                    echo "Unsupported distribution. Please install 'dialog' manually."
+                    exit 1 
+                    ;;
+            esac
+        else
+            echo "Could not determine OS. Please install 'dialog' manually."
+            exit 1
+        fi
     fi
-fi
+}
+
+# Check if the script is run as root
+check_root_permissions() {
+    if [[ $EUID -ne 0 ]]; then
+        dialog --yesno "This script requires root privileges. Do you want to run it with 'sudo'?" 7 60
+        if [[ $? -eq 0 ]]; then
+            exec sudo bash "$0" "$@"  # Relaunch the script with sudo
+        else
+            echo "You need root privileges to run this script. Exiting."
+            exit 1
+        fi
+    fi
+}
 
 # Global variables
 declare -A shares
 declare -A share_options
 LOG_FILE="/var/log/nfs_smb_config_script.log"
+ADVANCED_OPTIONS=0 # Toggle for advanced options
 
 # Color codes for better readability
 GREEN='\033[0;32m'
@@ -31,7 +65,7 @@ determine_os_and_package_manager() {
         PM="dnf"
         FW="firewalld"
         NFS_SERVICE="nfs-server"
-        SMB_SERVICE="smb"
+        SMB_SERVICE="samba"
         NFS_CLIENT_PKG="nfs-utils"
         SMB_CLIENT_PKG="cifs-utils"
     elif [ -f /etc/debian_version ]; then
@@ -47,69 +81,35 @@ determine_os_and_package_manager() {
     fi
 }
 
-# Logging function with timestamps
-log_message() {
-    local message="$1"
-    echo -e "$(date +"%Y-%m-%d %H:%M:%S") - $message" | tee -a "$LOG_FILE"
+# Sanitize user input (whitelist approach)
+sanitize_input() {
+    local input="$1"
+    echo "$input" | sed 's/[^a-zA-Z0-9._\-\/: ]//g'
 }
 
-# Progress bar
-show_progress() {
-    local cmd="$1"
-    {
-        $cmd
-        echo "100"
-    } | dialog --gauge "$2" 10 60 0
-}
-
-# Install NFS server
-install_nfs_server() {
-    log_message "Installing NFS server utilities using $PM..."
-    show_progress "sudo $PM update -y && sudo $PM install -y $NFS_SERVICE" "Installing NFS server utilities..."
-    if ! command -v exportfs &> /dev/null; then
-        log_message "${RED}NFS server utilities installation failed.${NC}"
-        exit 1
-    fi
-    log_message "${GREEN}NFS server utilities installed successfully.${NC}"
-}
-
-# Install NFS client
-install_nfs_client() {
-    log_message "Installing NFS client utilities using $PM..."
-    show_progress "sudo $PM update -y && sudo $PM install -y $NFS_CLIENT_PKG" "Installing NFS client utilities..."
-    if ! command -v mount.nfs &> /dev/null; then
-        log_message "${RED}NFS client installation failed.${NC}"
-        exit 1
-    fi
-    log_message "${GREEN}NFS client utilities installed successfully.${NC}"
-}
-
-# Install SMB server
-install_smb_server() {
-    log_message "Installing SMB server utilities using $PM..."
-    show_progress "sudo $PM update -y && sudo $PM install -y $SMB_SERVICE" "Installing SMB server utilities..."
-    if ! command -v smbd &> /dev/null; then
-        log_message "${RED}SMB server utilities installation failed.${NC}"
-        exit 1
-    fi
-    log_message "${GREEN}SMB server utilities installed successfully.${NC}"
-}
-
-# Install SMB client
-install_smb_client() {
-    log_message "Installing SMB client utilities using $PM..."
-    show_progress "sudo $PM update -y && sudo $PM install -y $SMB_CLIENT_PKG" "Installing SMB client utilities..."
-    if ! command -v mount.cifs &> /dev/null; then
-        log_message "${RED}SMB client installation failed.${NC}"
-        exit 1
-    fi
-    log_message "${GREEN}SMB client utilities installed successfully.${NC}"
-}
-
-# Function to get a shared directory using Dialog with file browser
+# Get a shared directory using Dialog with file browser
 get_shared_directory() {
-    local dir=$(dialog --stdout --title "Select directory to share" --fselect / 10 60)
+    dialog --title "Select directory to share" --fselect / 10 60 2> /tmp/dir
+    local dir=$(< /tmp/dir)
+
+    if [[ ! -d "$dir" || ! -w "$dir" ]]; then
+        dialog --msgbox "The selected directory must exist and be writable. Please select another." 6 60
+        return 1
+    fi
     echo "$dir"
+}
+
+# Get a valid local directory for mounting with permission checks
+get_local_directory() {
+    while true; do
+        local_dir=$(dialog --stdout --title "Select local directory for mounting" --dselect / 10 60)
+        if [[ -d "$local_dir" && -w "$local_dir" ]]; then
+            break
+        else
+            dialog --msgbox "Invalid or inaccessible directory. Please select a writable directory." 10 60
+        fi
+    done
+    echo "$local_dir"
 }
 
 # Function to get a username for the SMB share
@@ -124,15 +124,14 @@ get_smb_password() {
     echo "$password"
 }
 
-# Function to get a valid network input
+# Function to get valid network input
 get_network() {
     while true; do
         network=$(dialog --inputbox "Enter the network (CIDR notation) or IP address(es) allowed to access the share (e.g., 192.168.1.0/24, 10.0.0.1):" 8 60 2>&1 >/dev/tty)
-        network=$(sanitize_input "$network")
         if [[ "$network" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || [[ "$network" =~ ^(([0-9]{1,3}\.){3}[0-9]{1,3},)+([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
             break
         else
-            dialog --msgbox "Invalid network format. Please use CIDR notation (e.g., 192.168.1.0/24) or comma-separated IP addresses (e.g., 192.168.1.100,192.168.1.101)." 6 60
+            dialog --msgbox "Invalid network format. Please use CIDR notation or comma-separated IP addresses." 6 60
         fi
     done
     echo "$network"
@@ -156,208 +155,210 @@ select_file_type() {
     esac
 }
 
-# Enhance the optimize_nfs_options function for security and greater user flexibility
-optimize_nfs_options() {
-    local filetype="$1"
-    local accessmode="$2"
-    local options="rw,sync,no_subtree_check,secure"
-
-    case "$filetype" in
-        "normal files") options+=",rsize=8192,wsize=8192" ;;
-        "music"|"documents"|"photos") options+=",rsize=4096,wsize=4096" ;;
-        "movies/tv") options+=",rsize=16384,wsize=16384" ;;
-    esac
-
-    [ "$accessmode" == "read-only" ] && options+=",ro"
-
-    while true; do
-        custom_opts=$(dialog --yesno "Do you want to add custom NFS mount options?" 6 40)
-        if [ $? -eq 0 ]; then
-            custom_options=$(dialog --inputbox "Enter custom NFS mount options (comma-separated):" 8 60 2>&1 >/dev/tty)
-            if validate_nfs_options "$custom_options"; then
-                options+=",${custom_options}"
-                break
-            else
-                dialog --msgbox "Invalid options format or unsupported options. Please try again." 6 60
-            fi
-        else
-            break
-        fi
-    done
-
-    echo "$options"
-}
-
 # Validate custom NFS mount options
 validate_nfs_options() {
     local options="$1"
     if ! echo "$options" | grep -qE '^(rw|ro|sync|async|no_subtree_check|no_root_squash|root_squash|all_squash|anonuid=[0-9]+|anongid=[0-9]+|sec=(sys|krb5|krb5i|krb5p)|rsize=[0-9]+|wsize=[0-9]+)(,[a-zA-Z0-9_=]+)*$'; then
        return 1
     fi
-    if echo "$options" | grep -qE '(^|,)no_root_squash(,|$)'; then
-        echo "WARNING: 'no_root_squash' is insecure and generally not recommended."
-    fi
     return 0
 }
 
-# Sanitize user input
-sanitize_input() {
-    local input="$1"
-    echo "$input" | sed 's/[^a-zA-Z0-9 ._\/-:]//g'
+# Optimize NFS options with advanced features if required
+optimize_nfs_options() {
+    local filetype="$1"
+    local accessmode="$2"
+    local options="rw,sync,no_subtree_check"
+
+    options+=",$(case "$filetype" in
+        "normal files") echo "rsize=8192,wsize=8192" ;;
+        "music"|"documents"|"photos") echo "rsize=4096,wsize=4096" ;;
+        "movies/tv") echo "rsize=16384,wsize=16384" ;;
+    esac)"
+
+    [ "$accessmode" == "read-only" ] && options+=",ro"
+
+    dialog --yesno "Do you want to add custom NFS mount options?" 6 40
+    if [ $? -eq 0 ]; then
+        custom_options=$(dialog --inputbox "Enter custom NFS mount options (comma-separated):" 8 60 2>&1 >/dev/tty)
+        if validate_nfs_options "$custom_options"; then
+            options+=",${custom_options}"
+        else
+            dialog --msgbox "Invalid custom options. Default options will be used." 6 40
+        fi
+    fi
+
+    echo "$options"
 }
 
 # Set up NFS exports
 setup_nfs_exports() {
     while true; do
         directory=$(get_shared_directory)
-        if [[ -d "$directory" && -w "$directory" ]]; then  # Check for both existence and write permission
-            break
-        else
-            dialog --msgbox "Invalid or inaccessible directory. Please select a directory where you have write permissions." 10 60
+        if [[ $? -eq 1 ]]; then continue; fi 
+
+        network=$(get_network)
+        accessmode=$(dialog --radiolist "Select access mode:" 10 40 2 \
+            1 "read-only" on \
+            2 "read/write" off 2>&1 >/dev/tty)
+
+        [ "$accessmode" -eq 1 ] && accessmode="read-only" || accessmode="read/write"
+
+        options="$(optimize_nfs_options "$(select_file_type)" "$accessmode")"
+        shares["$directory"]="$network($options,fsid=$(uuidgen))"
+
+        echo "$directory $network($options)" | sudo tee -a /etc/exports > /dev/null
+
+        if ! sudo exportfs -ra; then
+            dialog --msgbox "Error reloading NFS exports." 6 40
+            exit 1
         fi
-    done
 
-    network=$(get_network)
-    filetype=$(select_file_type)
-    accessmode=$(dialog --radiolist "Select access mode:" 10 40 2 \
-        1 "read-only" on \
-        2 "read/write" off 2>&1 >/dev/tty)
-
-    [ "$accessmode" -eq 1 ] && accessmode="read-only" || accessmode="read/write"
-
-    options=$(optimize_nfs_options "$filetype" "$accessmode")
-    share_options["$directory"]="$options"
-    fsid=$(uuidgen)
-    shares["$directory"]="$network($options,fsid=$fsid)"
-
-    # Use tee with sudo for /etc/exports modification
-    echo "$directory $network($options,fsid=$fsid)" | sudo tee -a /etc/exports > /dev/null
-
-    if ! sudo exportfs -ra; then
-        log_message "${RED}Error reloading NFS exports.${NC}"
-        exit 1
-    fi
-
-    if ! sudo systemctl enable --now $NFS_SERVICE; then
-        log_message "${RED}Error enabling/starting NFS service.${NC}"
-        exit 1
-    fi
-
-    configure_firewall # Assuming you have a firewall configuration function
-    log_message "${GREEN}NFS export setup complete.${NC}"
-}
-
-# Function to get a valid local directory for mounting with permission checks
-get_local_directory() {
-    while true; do
-        local_dir=$(dialog --stdout --title "Select local directory for mounting" --dselect / 10 60)
-        if [[ -d "$local_dir" && -w "$local_dir" ]]; then
-            break
-        else
-            dialog --msgbox "Invalid or inaccessible directory. Please select a directory where you have write permissions." 10 60
+        if ! sudo systemctl enable --now $NFS_SERVICE; then
+            dialog --msgbox "Error enabling/starting NFS service." 6 40
+            exit 1
         fi
-    done
-    echo "$local_dir"
-}
 
-# Set up NFS client
-setup_nfs_client() {
-    server=$(dialog --stdout --title "Enter NFS server address" --inputbox "Enter the NFS server hostname or IP address:" 8 60)
-    server=$(sanitize_input "$server")
-    
-    remote_dir=$(dialog --stdout --title "Enter remote directory" --inputbox "Enter the remote directory to mount:" 8 60)
-    remote_dir=$(sanitize_input "$remote_dir")
-    
-    local_dir=$(get_local_directory)
-
-    filetype=$(select_file_type)
-
-    if ! ping -c 3 "$server" &> /dev/null; then
-        log_message "${RED}Cannot reach NFS server $server.${NC}"
-        return 1  # Return an error code instead of exiting immediately
-    fi
-
-    if ! showmount -e "$server" | grep -q "$remote_dir"; then
-        log_message "${RED}Remote directory $remote_dir is not being shared by the NFS server. Ensure NFS server is running and network is accessible.${NC}"
-        return 1
-    fi
-
-    options=$(optimize_nfs_options "$filetype" "read/write")
-    while true; do
-        sudo mount -t nfs "$server:$remote_dir" "$local_dir" -o "$options"
-        if mount | grep "$local_dir" > /dev/null; then
-            log_message "${GREEN}NFS share mounted successfully.${NC}"
-            echo "$server:$remote_dir $local_dir nfs $options 0 0" | sudo tee -a /etc/fstab 
-            break
-        else
-            log_message "${RED}Failed to mount NFS share. Ensure NFS server is running and network is accessible.${NC}"
-            read -p "Retry mounting? (yes/no): " retry
-            case $retry in
-                [Yy]*) continue ;;
-                [Nn]*) return 1 ;;
-                *) echo "Invalid choice. Exiting."; return 1 ;;
-            esac
-        fi
+        log_message "${GREEN}NFS export setup complete.${NC}"
+        break
     done
 }
 
+# Set up SMB exports
 setup_smb_exports() {
     while true; do
         directory=$(get_shared_directory)
-        if [[ -d "$directory" && -w "$directory" ]]; then  # Check for both existence and write permission
-            break
-        else
-            dialog --msgbox "Invalid or inaccessible directory. Please select a directory where you have write permissions." 10 60
+        if [[ $? -eq 1 ]]; then continue; fi 
+
+        sharename=$(dialog --stdout --title "Enter share name for the SMB share" --inputbox "Share Name:" 8 60)
+        sharename=$(sanitize_input "$sharename")
+        
+        accessmode=$(dialog --radiolist "Select access mode:" 10 40 2 \
+            1 "read-only" on \
+            2 "read/write" off 2>&1 >/dev/tty)
+
+        [ "$accessmode" -eq 1 ] && accessmode="read-only" || accessmode="read/write"
+
+        options="path = $directory\nbrowseable = yes\n"
+        options+=[ "$accessmode" == "read-only" ] && "read only = yes\n" || "read only = no\n"
+
+        dialog --yesno "Do you want to add custom SMB share options?" 6 40
+        if [ $? -eq 0 ]; then
+            while true; do
+                custom_option=$(dialog --inputbox "Enter custom SMB share options (one per line, blank line to finish):" 8 60 2>&1 >/dev/tty)
+                [ -z "$custom_option" ] && break
+                options+="$custom_option\n"
+            done 
         fi
+
+        share_options["$directory"]="$options"
+        shares["$sharename"]="$directory"
+
+        echo "[$sharename]\n$options" | sudo tee -a /etc/samba/smb.conf 
+
+        if ! sudo systemctl enable --now $SMB_SERVICE; then
+            dialog --msgbox "Error enabling/starting SMB service." 6 40
+            exit 1
+        fi
+
+        log_message "${GREEN}SMB share setup complete.${NC}"
+        break
     done
-
-    sharename=$(dialog --stdout --title "Enter share name for the SMB share" --inputbox "Share Name:" 8 60) 
-    sharename=$(sanitize_input "$sharename")
-    
-    accessmode=$(dialog --radiolist "Select access mode:" 10 40 2 \
-        1 "read-only" on \
-        2 "read/write" off 2>&1 >/dev/tty)
-
-    [ "$accessmode" -eq 1 ] && accessmode="read-only" || accessmode="read/write"
-
-    options="path = $directory\nbrowseable = yes\n"
-    options+=[ "$accessmode" == "read-only" ] && "read only = yes\n" || "read only = no\n"
-
-    custom_opts=$(dialog --yesno "Do you want to add custom SMB share options?" 6 40)
-    if [ $? -eq 0 ]; then
-        while true; do
-            custom_option=$(dialog --inputbox "Enter custom SMB share options (one per line, blank line to finish):" 8 60 2>&1 >/dev/tty)
-            [ -z "$custom_option" ] && break
-            options+="$custom_option\n"
-        done 
-    fi
-
-    share_options["$directory"]="$options"
-    shares["$sharename"]="$directory"
-
-    show_progress "sudo bash -c 'cat >> /etc/samba/smb.conf <<EOL
-[$sharename]
-$options
-EOL'" "Setting up SMB export..."
-
-    if ! sudo systemctl enable --now $SMB_SERVICE; then
-        log_message "${RED}Error enabling/starting SMB service.${NC}"
-        exit 1
-    fi
-
-    configure_firewall # Assuming you have a firewall configuration function
-    log_message "${GREEN}SMB share setup complete.${NC}"
 }
 
-# Add functions for better management of NFS/SMB shares here...
+# Function for managing NFS shares
 manage_nfs_shares() {
-    dialog --msgbox "NFS Share Management is not implemented yet. Stay tuned!" 6 40
+    while true; do
+        nfs_shares_list=$(exportfs -v | awk '{print $1, $3}' | column -t)
+        
+        if [[ -z "$nfs_shares_list" ]]; then
+            dialog --msgbox "No NFS shares found." 6 30
+            break
+        fi
+
+        selected_share=$(dialog --menu "Select an NFS share to manage:" 20 60 10 $nfs_shares_list 3>&1 1>&2 2>&3)
+        if [[ $? -ne 0 ]]; then break; fi  # Exit if user cancels
+
+        manage_nfs_share "$selected_share"
+    done
 }
 
+# Function to manage an individual NFS share
+manage_nfs_share() {
+    local directory="$1"
+
+    while true; do
+        action=$(dialog --menu "Choose an action for NFS share '$directory':" 15 50 3 \
+            1 "Edit" \
+            2 "Delete" \
+            3 "Back to Main Menu" 3>&1 1>&2 2>&3)
+
+        case $action in
+            1) 
+                dialog --msgbox "Editing functionality for NFS shares will be implemented next." 6 40
+                # Here you would implement the logic to show and edit current settings
+                ;;
+            2) 
+                sudo sed -i "/^$directory /d" /etc/exports
+                sudo exportfs -ra
+                dialog --msgbox "NFS share '$directory' deleted." 6 30
+                log_message "Deleted NFS share: $directory"
+                break
+                ;;
+            3) 
+                break
+                ;;
+        esac
+    done
+}
+
+# Function for managing SMB shares
 manage_smb_shares() {
-    dialog --msgbox "SMB Share Management is not implemented yet. Stay tuned!" 6 40
+    while true; do
+        smb_shares_list=$(testparm -s | grep -E '^\[' | cut -d ']' -f 1 | cut -d '[' -f 2)
+        
+        if [[ -z "$smb_shares_list" ]]; then
+            dialog --msgbox "No SMB shares found." 6 30
+            break
+        fi
+
+        selected_share=$(dialog --menu "Select an SMB share to manage:" 20 60 10 $smb_shares_list 3>&1 1>&2 2>&3)
+        if [[ $? -ne 0 ]]; then break; fi  # Exit if user cancels
+
+        manage_smb_share "$selected_share"
+    done
 }
 
+# Function to manage an individual SMB share
+manage_smb_share() {
+    local sharename="$1"
+
+    while true; do
+        action=$(dialog --menu "Choose an action for SMB share '$sharename':" 15 50 3 \
+            1 "Edit" \
+            2 "Delete" \
+            3 "Back to Main Menu" 3>&1 1>&2 2>&3)
+
+        case $action in
+            1) 
+                dialog --msgbox "Editing functionality for SMB shares will be implemented next." 6 40
+                # Here you would implement the logic to show and edit current settings
+                ;;
+            2) 
+                sudo sed -i "/^\[$sharename\]/,/^\[/d" /etc/samba/smb.conf
+                sudo systemctl restart smbd
+                dialog --msgbox "SMB share '$sharename' deleted." 6 30
+                log_message "Deleted SMB share: $sharename"
+                break
+                ;;
+            3) 
+                break
+                ;;
+        esac
+    done
+}
+
+# Firewall configuration function
 configure_firewall() {
     log_message "Configuring firewall..."
     if [ "$FW" == "firewalld" ]; then
@@ -366,10 +367,7 @@ configure_firewall() {
         sudo firewall-cmd --permanent --add-service=rpc-bind
         sudo firewall-cmd --permanent --add-service=samba
         sudo firewall-cmd --reload
-        if [ $? -ne 0 ]; then
-            log_message "${RED}Failed to configure firewalld.${NC}"
-            exit 1
-        fi
+        log_message "${GREEN}Firewall configured successfully.${NC}"
     elif [ "$FW" == "ufw" ]; then
         sudo ufw allow proto tcp from any to any port 2049
         sudo ufw allow proto udp from any to any port 2049
@@ -379,39 +377,42 @@ configure_firewall() {
         sudo ufw allow proto udp from any to any port 138
         sudo ufw allow proto tcp from any to any port 139
         sudo ufw allow proto tcp from any to any port 445
+        log_message "${GREEN}Firewall configured successfully.${NC}"
         sudo ufw reload
-        if [ $? -ne 0 ]; then
-            log_message "${RED}Failed to configure UFW.${NC}"
-            exit 1
-        fi
     fi
-    log_message "${GREEN}Firewall configured successfully.${NC}"
 }
 
+# Display main menu
 display_main_menu() {
-    local show_advanced=0 # Toggle for advanced options
     while true; do
-        if [ $show_advanced -eq 1 ]; then
-            cmd=(dialog --clear --backtitle "NFS/SMB Configuration Script" --title "Main Menu" --menu "Choose an option:" 0 0 0)
-            options=(
-                1 "Install NFS Client"
-                2 "Install NFS Server"
-                3 "Install SMB Client"
-                4 "Install SMB Server"
-                5 "Manage NFS Shares"
-                6 "Manage SMB Shares"
-                7 "Exit"
-                8 "Toggle Advanced Options (off)"
-            )
-        else
-            cmd=(dialog --clear --backtitle "NFS/SMB Configuration Script" --title "Main Menu" --menu "Choose an option:" 0 0 0)
-            options=(
-                1 "Install NFS Client"
-                2 "Install NFS Server"
-                3 "Install SMB Client"
-                4 "Install SMB Server"
-                5 "Manage NFS Shares"
-                6 "Manage SMB Shares"
-                7 "Exit"
-                8 "Toggle Advanced Options (on)"
-            )
+        cmd=(dialog --clear --backtitle "NFS/SMB Configuration Script" --title "Main Menu" --menu "Choose an option:" 0 0 0)
+        options=(
+            1 "Install NFS Client"
+            2 "Install NFS Server"
+            3 "Install SMB Client"
+            4 "Install SMB Server"
+            5 "Manage NFS Shares"
+            6 "Manage SMB Shares"
+            7 "Toggle Advanced Options"
+            8 "Exit"
+        )
+        choice=$("${cmd[@]}" "${options[@]}" 2>&1 >/dev/tty)
+
+        case $choice in
+            1) install_nfs_client && setup_nfs_exports ;;
+            2) install_nfs_server && setup_nfs_exports ;;
+            3) install_smb_client && setup_smb_exports ;;
+            4) install_smb_server && setup_smb_exports ;;
+            5) manage_nfs_shares ;;
+            6) manage_smb_shares ;;
+            7) 
+                ADVANCED_OPTIONS=$((1-ADVANCED_OPTIONS))  # Toggle advanced options 
+                if [ $ADVANCED_OPTIONS -eq 1 ]; then
+                    dialog --msgbox "Advanced Options are now enabled." 6 40
+                else
+                    dialog --msgbox "Advanced Options are now disabled." 6 40
+                fi
+                ;;
+            8) 
+                dialog --yesno "Are you sure you want to exit?" 6 30
+                if [[ $?
